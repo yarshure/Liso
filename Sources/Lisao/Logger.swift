@@ -31,11 +31,17 @@ public final class Logger: @unchecked Sendable {
         var category: String
         var fileURL: URL?
         var writesToConsole: Bool
+        var fileHandle: FileHandle?
+        var bufferedData: Data
     }
 
     private let queue: DispatchQueue
     private let fileManager: FileManager
     private let dateProvider: @Sendable () -> Date
+    private let formatter: ISO8601DateFormatter
+    private let flushThreshold = 32 * 1024
+    private let flushInterval: DispatchTimeInterval = .milliseconds(100)
+    private let flushTimer: DispatchSourceTimer
     private var state: State
 
     public init(
@@ -48,7 +54,22 @@ public final class Logger: @unchecked Sendable {
         self.queue = DispatchQueue(label: "Lisao.Logger.\(category)")
         self.fileManager = fileManager
         self.dateProvider = dateProvider
-        self.state = State(category: category, fileURL: fileURL, writesToConsole: writesToConsole)
+        self.formatter = ISO8601DateFormatter()
+        self.formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        self.flushTimer = DispatchSource.makeTimerSource(queue: queue)
+        self.state = State(
+            category: category,
+            fileURL: fileURL,
+            writesToConsole: writesToConsole,
+            fileHandle: nil,
+            bufferedData: Data()
+        )
+
+        flushTimer.schedule(deadline: .now() + flushInterval, repeating: flushInterval)
+        flushTimer.setEventHandler { [weak self] in
+            self?.flushBufferedData()
+        }
+        flushTimer.resume()
     }
 
     public convenience init(configuration: Configuration, fileManager: FileManager = .default) {
@@ -62,20 +83,24 @@ public final class Logger: @unchecked Sendable {
     }
 
     public func updateFileURL(_ fileURL: URL?) {
-        queue.sync {
-            state.fileURL = fileURL
+        queue.async {
+            if self.state.fileURL == fileURL { return }
+            self.flushBufferedData()
+            self.closeFileHandle()
+            self.state.fileURL = fileURL
+            _ = self.openFileHandleIfNeeded()
         }
     }
 
     public func updateCategory(_ category: String) {
-        queue.sync {
-            state.category = category
+        queue.async {
+            self.state.category = category
         }
     }
 
     public func updateConsoleOutput(enabled: Bool) {
-        queue.sync {
-            state.writesToConsole = enabled
+        queue.async {
+            self.state.writesToConsole = enabled
         }
     }
 
@@ -133,23 +158,23 @@ public final class Logger: @unchecked Sendable {
         let message = message()
         let now = dateProvider()
 
-        queue.sync {
-            let rendered = Self.render(
+        queue.async {
+            let rendered = self.render(
                 date: now,
                 level: level,
-                category: state.category,
+                category: self.state.category,
                 message: message,
                 file: file,
                 function: function,
                 line: line
             )
 
-            if state.writesToConsole {
+            if self.state.writesToConsole {
                 print(rendered)
             }
 
-            if let fileURL = state.fileURL {
-                append(rendered + "\n", to: fileURL)
+            if let fileURL = self.state.fileURL {
+                self.append(rendered + "\n", to: fileURL)
             }
         }
     }
@@ -162,7 +187,7 @@ public final class Logger: @unchecked Sendable {
         #endif
     }
 
-    private static func render(
+    private func render(
         date: Date,
         level: Level,
         category: String,
@@ -171,14 +196,29 @@ public final class Logger: @unchecked Sendable {
         function: String,
         line: Int
     ) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let timestamp = formatter.string(from: date)
         let source = "\(file):\(line) \(function)"
         return "\(timestamp) [\(level.rawValue)] [\(category)] \(message) (\(source))"
     }
 
     private func append(_ text: String, to fileURL: URL) {
+        guard let data = text.data(using: .utf8) else { return }
+        state.bufferedData.append(data)
+
+        if state.fileHandle == nil {
+            _ = openFileHandleIfNeeded()
+        }
+
+        if state.bufferedData.count >= flushThreshold {
+            flushBufferedData()
+        }
+    }
+
+    private func openFileHandleIfNeeded() -> Bool {
+        guard state.fileHandle == nil, let fileURL = state.fileURL else {
+            return state.fileHandle != nil
+        }
+
         do {
             let directory = fileURL.deletingLastPathComponent()
             if !fileManager.fileExists(atPath: directory.path) {
@@ -189,21 +229,45 @@ public final class Logger: @unchecked Sendable {
                 try Data().write(to: fileURL)
             }
 
-            guard let data = text.data(using: .utf8) else {
-                return
+            guard let handle = FileHandle(forWritingAtPath: fileURL.path) else {
+                return false
             }
 
-            if let handle = FileHandle(forWritingAtPath: fileURL.path) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            } else {
-                try data.write(to: fileURL)
-            }
+            handle.seekToEndOfFile()
+            state.fileHandle = handle
+            return true
         } catch {
-            if state.writesToConsole {
-                print("Logger file write failed: \(error.localizedDescription)")
-            }
+            reportFileWriteFailure(error)
+            return false
+        }
+    }
+
+    private func flushBufferedData() {
+        guard !state.bufferedData.isEmpty else { return }
+        guard openFileHandleIfNeeded(), let handle = state.fileHandle else { return }
+
+        handle.write(state.bufferedData)
+        state.bufferedData.removeAll(keepingCapacity: true)
+    }
+
+    private func closeFileHandle() {
+        guard let handle = state.fileHandle else { return }
+        handle.closeFile()
+        state.fileHandle = nil
+    }
+
+    private func reportFileWriteFailure(_ error: Error) {
+        if state.writesToConsole {
+            print("Logger file write failed: \(error.localizedDescription)")
+        }
+    }
+
+    deinit {
+        flushTimer.setEventHandler {}
+        flushTimer.cancel()
+        queue.sync {
+            self.flushBufferedData()
+            self.closeFileHandle()
         }
     }
 }
